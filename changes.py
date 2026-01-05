@@ -3,6 +3,7 @@ import mediapipe as mp
 import time
 import numpy as np
 
+#για να παίζει μουσική μέσα από την python
 import pygame
 
 pygame.mixer.init()
@@ -13,7 +14,6 @@ has_started = False     #did music ever start playing
 
 current_volume = 0.5
 pygame.mixer.music.set_volume(current_volume)
-
 
 class HapticManager:
     def __init__(self):
