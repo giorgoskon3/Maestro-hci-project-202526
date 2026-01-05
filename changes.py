@@ -75,6 +75,7 @@ class GestureManager:
 
     def analyze_gesture(self, hand_lms):
         """Υπολογίζει pinch και επιστρέφει δεδομένα"""
+        """pinch: αντίχειρας + δείκτης"""
         thumb_tip = hand_lms.landmark[4]
         index_tip = hand_lms.landmark[8]
         
