@@ -1,5 +1,5 @@
 #=====Fist: play-pause
-#=====Pinch: volume (> distance --> lower)
+#=====Pinch: volume (> distance --> higher)
 #=====Wrist Height: speed (< height --> lower)
 
 import cv2
