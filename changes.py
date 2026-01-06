@@ -2,19 +2,20 @@ import cv2
 import mediapipe as mp
 import time
 import numpy as np
+import threading
+import sounddevice as sd    #for music playing
+import librosa              #for music speed
 
-#για να παίζει μουσική μέσα από την python
-import pygame
+#===================================================================
 
-pygame.mixer.init()
-pygame.mixer.music.load("music.mp3")
+#Audio setup
+audio, sr = librosa.load("music.mp3", sr=None, mono=True)
+music_speed = 1.0
+music_playing = False
 
-is_playing = False      #is music playing at the moment
-has_started = False     #did music ever start playing
+#=====================================================================
 
-current_volume = 0.5
-pygame.mixer.music.set_volume(current_volume)
-
+#Haptics setup
 class HapticManager:
     def __init__(self):
         try:
@@ -30,7 +31,33 @@ class HapticManager:
         """Βασική δόνηση ανάλογα με την ένταση (0-100)"""
         if self.connected:
             pass
+#========================================================================
 
+def music_loop():
+    global music_speed, music_playing
+
+    pos = 0
+    chunk_size = 2048
+
+    while True:
+        if not music_playing:
+            sd.stop()
+            sd.sleep(50)
+            continue
+
+        chunk = audio[pos:pos + chunk_size]
+
+        if len(chunk) < 32:
+            pos = 0
+            continue
+
+        stretched = librosa.effects.time_stretch(chunk.astype(np.float32), music_speed)
+        sd.play(stretched, sr, blocking=True)
+
+        pos += int(chunk_size * music_speed)
+        sd.sleep(5)
+
+#=================================================================================        
 
 class GestureManager:
     def __init__(self):
@@ -94,104 +121,78 @@ class GestureManager:
 
     def on_fist_detected(self):
         """Συνάρτηση που καλείται όταν ανιχνευθεί γροθιά"""
+        """play-pause"""
 
-        global is_playing, has_started
+        global music_playing
 
         current_time = time.time()
         if current_time - self.last_fist_time > self.fist_cooldown:
             self.last_fist_time = current_time
-
-            #fist to play-pause
-            print("👊 FIST DETECTED! Action triggered!")
-            if not has_started:
-                pygame.mixer.music.play()
-                has_started = True
-                is_playing = True
-                print("▶️ START")
-            elif is_playing:
-                pygame.mixer.music.pause()
-                is_playing = False
-                print("⏸ PAUSE")
-            else:
-                pygame.mixer.music.unpause()
-                is_playing = True
-                print("⏯ RESUME")
+            music_playing = not music_playing
+            print("▶️ PLAY" if music_playing else "⏸ PAUSE")
             return True
         return False
 
+#======================================================================================
+
 
 def main():
-    global current_volume
+    global music_speed
 
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    
+
     haptics = HapticManager()
     gestures = GestureManager()
-    
+
+    threading.Thread(target=music_loop, daemon=True).start()
+
     print("\n🚀 MAESTRO HAND TRACKER")
-    print("👊 Fist = Trigger Action")
-    print("🤏 Pinch (Thumb+Index) = Volume Control")
+    print("👊 Fist = Play / Pause")
+    print("🤏 Pinch + Hand Height = Speed")
     print("Press 'q' to quit\n")
 
     while cap.isOpened():
-        success, frame = cap.read()
-        if not success: 
+        ret, frame = cap.read()
+        if not ret:
             break
-        
+
         frame = cv2.flip(frame, 1)
         h, w, _ = frame.shape
-        
-        hands_landmarks = gestures.get_hand_data(frame)
-        
-        if hands_landmarks:
-            for hand_lms in hands_landmarks:
+
+        hands = gestures.get_hand_data(frame)
+
+        if hands:
+            for hand_lms in hands:
                 gestures.mp_draw.draw_landmarks(
                     frame, hand_lms, gestures.mp_hands.HAND_CONNECTIONS
                 )
-                
+
                 data = gestures.analyze_gesture(hand_lms)
-                
-                # Fist Detection
-                if data['is_fist']:
-                    if gestures.on_fist_detected():
-                        cv2.putText(frame, "FIST!", (w//2 - 100, h//2), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 5)
-                
-                # Volume Control με Pinch
-                
-                #if data['fingers'][0] == 1 and data['fingers'][1] == 1:
-                 #   haptics.play_pinch(data['pinch_intensity'])
-                  #  print(f"Volume: {data['pinch_intensity']}%")
 
-                if data['fingers'][0] == 1 and data['fingers'][1] == 1:
-                    target_volume = data['pinch_intensity'] / 100.0
+                # 👊 Fist → Play / Pause
+                if data["is_fist"]:
+                    gestures.on_fist_detected()
 
-                    #Smooth volume change
-                    current_volume = current_volume * 0.85 + target_volume * 0.15
+                # 🤏 Pinch + Y → Speed
+                if data["fingers"][0] == 1 and data["fingers"][1] == 1:
+                    wrist_y = hand_lms.landmark[0].y
+                    target = np.interp(wrist_y, [0.8, 0.2], [0.6, 1.6])
+                    music_speed = music_speed * 0.9 + target * 0.1
+                    music_speed = max(0.5, min(2.0, music_speed))
 
-                    #Clamp volume to [0.0, 1.0]
-                    current_volume = max(0.0, min(1.0, current_volume))
+                    intensity = int(np.interp(music_speed, [0.5, 2.0], [0, 100]))
+                    haptics.play_pinch(intensity)
+                    print(f"🎵 Speed: {music_speed:.2f}x")
 
-                    pygame.mixer.music.set_volume(current_volume)
-                    haptics.play_pinch(data['pinch_intensity'])
-                    print(f"🔊 Volume: {int(current_volume * 100)}%")
-                
                 # UI
-                cv2.putText(frame, f"Fingers: {data['fingers_count']}", (50, 80), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
-                
-                # Volume Bar
-                cv2.rectangle(frame, (50, 150), (100, 450), (255, 255, 255), 2)
-                fill_level = int(data['pinch_intensity'] * 3)
-                cv2.rectangle(frame, (50, 450 - fill_level), (100, 450), (0, 255, 255), -1)
-                cv2.putText(frame, f"{data['pinch_intensity']}%", (50, 480), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2.putText(frame, f"Speed: {music_speed:.2f}x", (50, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 200, 0), 3)
 
-        cv2.imshow('Maestro Gesture Recognition', frame)
-        
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        cv2.imshow("Maestro Gesture Recognition", frame)
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
     cap.release()
