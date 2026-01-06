@@ -1,3 +1,7 @@
+#=====Fist: play-pause
+#=====Pinch: volume (> distance --> lower)
+#=====Wrist Height: speed (< height --> lower)
+
 import cv2
 import mediapipe as mp
 import time
@@ -150,7 +154,8 @@ def main():
 
     print("\n🚀 MAESTRO HAND TRACKER")
     print("👊 Fist = Play / Pause")
-    print("🤏 Pinch + Hand Height = Speed")
+    print("🤏 Pinch = Volume")
+    print("✋ Wrist Height = Speed")
     print("Press 'q' to quit\n")
 
     while cap.isOpened():
@@ -175,16 +180,22 @@ def main():
                 if data["is_fist"]:
                     gestures.on_fist_detected()
 
-                # 🤏 Pinch + Y → Speed
+                # 🤏 Pinch → Volume
                 if data["fingers"][0] == 1 and data["fingers"][1] == 1:
-                    wrist_y = hand_lms.landmark[0].y
-                    target = np.interp(wrist_y, [0.8, 0.2], [0.6, 1.6])
-                    music_speed = music_speed * 0.9 + target * 0.1
-                    music_speed = max(0.5, min(2.0, music_speed))
+                    # Thumb + index pinch → control volume
+                    pinch_dist = ((hand_lms.landmark[4].x - hand_lms.landmark[8].x)**2 + (hand_lms.landmark[4].y - hand_lms.landmark[8].y)**2)**0.5
+                    volume_target = np.interp(pinch_dist, [0.02, 0.15], [0, 100])
+                    current_volume = current_volume * 0.85 + volume_target * 0.15
+                    current_volume = max(0, min(100, current_volume))
+                    haptics.play_pinch(int(current_volume))
+                    print(f"🔊 Volume: {int(current_volume)}%")
 
-                    intensity = int(np.interp(music_speed, [0.5, 2.0], [0, 100]))
-                    haptics.play_pinch(intensity)
-                    print(f"🎵 Speed: {music_speed:.2f}x")
+                # ✋ Wrist height → Speed
+                wrist_y = hand_lms.landmark[0].y  # y of wrist
+                target_speed = np.interp(wrist_y, [0.8, 0.2], [0.6, 1.6])
+                music_speed = music_speed * 0.9 + target_speed * 0.1
+                music_speed = max(0.5, min(2.0, music_speed))
+                print(f"🎵 Speed: {music_speed:.2f}x")
 
                 # UI
                 cv2.putText(frame, f"Speed: {music_speed:.2f}x", (50, 80),
