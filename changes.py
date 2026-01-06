@@ -14,18 +14,15 @@ import librosa              # For changing speed
 import random
 
 #=================================================================================================
-
 # Audio setup
 audio, sr = librosa.load("music.mp3", sr=None, mono=True)
 music_speed = 1.0
 music_playing = False
-current_volume = 50  # 0-100 scale
-
-# Challenge global
-challenge_active = False
+current_volume = 50          # 0-100 scale
+music_pitch = 0              # 0 = normal pitch
+challenge_active = False     # true when challenge event happens
 
 #=================================================================================================
-
 # Haptics setup
 class HapticManager:
     def __init__(self):
@@ -56,10 +53,9 @@ class HapticManager:
             self.player.submit_dot("VestBack", intensity=intensity, device_name=self.vest_name)
 
 #=================================================================================================
-
 # Music loop
 def music_loop():
-    global music_speed, music_playing, audio, sr
+    global music_speed, music_playing, audio, sr, music_pitch
 
     pos = 0
     chunk_size = 2048
@@ -80,8 +76,14 @@ def music_loop():
         stretched = librosa.effects.time_stretch(chunk.astype(np.float32), music_speed)
         sd.play(stretched, sr, blocking=True)
 
+        # Apply pitch shift
+        pitched = librosa.effects.pitch_shift(stretched, sr, n_steps=music_pitch)
+        sd.play(pitched, sr, blocking=True)
+
         pos += int(chunk_size * music_speed)
         sd.sleep(5)
+
+#===================================================================================================
 
 # Challenge loop
 def challenge_loop(haptics):
@@ -96,7 +98,6 @@ def challenge_loop(haptics):
         haptics.challenge_signal()
 
 #=================================================================================================
-
 # Gesture manager (gloves)
 class GestureManager:
     def __init__(self):
@@ -154,7 +155,6 @@ class GestureManager:
         return False
 
 #=================================================================================================
-
 # Main program
 def main():
     global music_speed, current_volume, challenge_active
@@ -174,7 +174,7 @@ def main():
     print("👊 Fist = Play / Pause")
     print("🤏 Pinch → Volume (Front Vest)")
     print("🖐 Wrist Height → Speed (Back Vest)")
-    print("⚡ Challenge = Index Finger Up")
+    print("⚡ Challenge (Front + Back Vest) = Index Finger Up")
     print("Press 'q' to quit\n")
 
     while cap.isOpened():
@@ -206,7 +206,7 @@ def main():
                     haptics.play_volume_feedback(int(current_volume))
                     print(f"🔊 Volume: {int(current_volume)}%")
 
-                # 🖐 Wrist height → Speed (independent of pinch)
+                # 🖐 Wrist height → Speed
                 wrist_y = hand_lms.landmark[0].y
                 target_speed = np.interp(wrist_y, [0.8, 0.2], [0.6, 1.6])
                 music_speed = music_speed * 0.9 + target_speed * 0.1
@@ -217,10 +217,10 @@ def main():
 
                 # ⚡ Challenge → Index finger up
                 if challenge_active:
-                    fingers = data['fingers']  # [thumb, index, middle, ring, pinky]
+                    fingers = data['fingers']
                     if fingers == [0, 1, 0, 0, 0]:
                         print("✅ Challenge completed!")
-                        music_speed = min(2.0, music_speed + 0.2)  # reward
+                        music_pitch += 2  # increase pitch by 2 semitones
                         challenge_active = False
 
                 # UI
@@ -240,6 +240,5 @@ def main():
     cv2.destroyAllWindows()
 
 #=================================================================================================
-
 if __name__ == "__main__":
     main()
