@@ -178,7 +178,11 @@ class GestureManager:
     def get_hand_data(self, frame):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.hands.process(rgb)
-        return results.multi_hand_landmarks if results.multi_hand_landmarks else []
+        if results.multi_hand_landmarks:
+        # Return both landmarks and handedness
+            return list(zip(results.multi_hand_landmarks, results.multi_handedness))
+        else:
+            return []
 
     def recognize_fingers(self, hand_lms):
         fingers = []
@@ -211,7 +215,7 @@ class GestureManager:
 #=================================================================================================
 # Main
 def main():
-    global music_speed, current_volume, prev_volume, prev_speed, challenge_active
+    global music_speed, current_volume, prev_volume, prev_speed, music_pitch, challenge_active
 
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     haptics = HapticManager()
@@ -226,13 +230,14 @@ def main():
         ret, frame = cap.read()
         if not ret:
             break
-
         frame = cv2.flip(frame, 1)
         hands = gestures.get_hand_data(frame)
-
         if hands:
-            for i, hand_lms in enumerate(hands):
-                if not turns.is_active(i):
+            for i, (hand_lms, handedness) in enumerate(hands):
+                hand_label = handedness.classification[0].label
+                # Map left hand → player 0, right hand → player 1
+                player_id = 0 if hand_label == 'Left' else 1
+                if not turns.is_active(player_id):
                     continue  # Ignore gestures if not their turn
                 gestures.mp_draw.draw_landmarks(frame, hand_lms, gestures.mp_hands.HAND_CONNECTIONS)
                 data = gestures.analyze_gesture(hand_lms)
@@ -248,14 +253,14 @@ def main():
                     current_volume = np.clip(current_volume, 0, 100)
 
                     if current_volume < prev_volume:
-                        if turns.current_player ==0:
+                        if player_id == 0:
                             haptics.front_left(int(current_volume))
-                        elif turns.current_player ==1:
+                        elif player_id ==1:
                             haptics.sleeve_pulse(int(current_volume))
                     else:
-                        if turns.current_player ==0:
+                        if player_id ==0:
                             haptics.front_right(int(current_volume))
-                        elif turns.current_player ==1:
+                        elif player_id ==1:
                             haptics.sleeve_pulse(int(current_volume))
 
                     prev_volume = current_volume
@@ -268,14 +273,14 @@ def main():
 
                 intensity = int(np.interp(music_speed, [0.5, 2.0], [0, 100]))
                 if music_speed < prev_speed:
-                    if turns.current_player ==0:
+                    if player_id ==0:
                         haptics.back_left(intensity)
-                    elif turns.current_player ==1:
+                    elif player_id ==1:
                         haptics.sleeve_pulse(intensity)
                 else:
-                    if turns.current_player ==0:
+                    if player_id ==0:
                         haptics.back_right(intensity)
-                    elif turns.current_player ==1:
+                    elif player_id ==1:
                         haptics.sleeve_pulse(intensity)
 
                 prev_speed = music_speed
