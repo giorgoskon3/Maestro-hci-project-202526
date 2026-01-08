@@ -1,8 +1,29 @@
+#===========================Game Description==============================#
+
+#Player 0: vest + glove
+#Player 1: sleeve + glove
+
+#===Users take turns===#
+#One player is active at a time
+#When signal is sent to glove, it's their turn
+#feedback is sent to both players, but only one at a time can play
+
+#===For both players===##
 #Fist: play-pause
-#Pinch (thumb + index): volume (> distance --> higher) --> feedback to front vest (left for low, right for high)
-#Wrist Height: speed (< height --> lower) --> feedback to back vest (left for low, right for hight)
-#Challenge at random time intervals:
-#signal to front and back vest --> user points index up --> music plays at higher pitch
+
+#Pinch (thumb + index): volume (> distance --> higher)
+#for player 0 --> feedback to front vest (left for low, right for high)
+#for player 1 --> feedback to sleeve
+
+#Wrist Height: speed (< height --> lower)
+#for player 0 --> feedback to back vest (left for low, right for hight)
+#for player 1 --> feedback to sleeve
+
+#Challenge 1:
+#at random time intervals
+#signal to front + back vest (player 0) or to sleeve (player 1) --> user points index up --> music plays at higher pitch
+
+#================================================================================================
 
 import cv2
 import mediapipe as mp
@@ -62,6 +83,14 @@ class HapticManager:
             self.player.submit_dot("VestFront", intensity=intensity, device_name=self.vest_name)
             self.player.submit_dot("VestBack", intensity=intensity, device_name=self.vest_name)
 
+    def glove_pulse(self, intensity=100):
+        if self.connected:
+            self.player.submit_dot("Glove", intensity=intensity, device_name=self.vest_name)
+
+    def sleeve_pulse(self, intensity=100):
+        if self.connected:
+            self.player.submit_dot("Arm", intensity=intensity, device_name=self.vest_name)
+
 #=================================================================================================
 # Music loop
 def music_loop():
@@ -90,16 +119,50 @@ def music_loop():
 
 #===================================================================================================
 # Challenge loop
-def challenge_loop(haptics):
+def challenge_loop(haptics, turns):
     global challenge_active
     while True:
         time.sleep(random.uniform(5, 15))
         challenge_active = True
         print("⚡ Challenge started! Point your index finger up!")
-        haptics.challenge_signal()
+        if turns.current_player == 0:
+            haptics.challenge_signal()
+        else:
+            haptics.sleeve_pulse(100)
 
 #=================================================================================================
-# Gesture manager (glove)
+#Player turns manager
+class TurnManager:
+    def __init__(self, haptics):
+        self.current_player = 0  # 0 = vest player, 1 = sleeve player
+        self.haptics = haptics
+        self.turn_duration = 20  # seconds
+        self.last_switch = time.time()
+
+        self.signal_turn_start()
+
+    def signal_turn_start(self):
+        if self.current_player == 0:
+            print("🎮 Vest Player's Turn")
+            self.haptics.glove_pulse(100)
+        else:
+            print("🎮 Sleeve Player's Turn")
+            self.haptics.sleeve_pulse(100)
+
+    def update(self):
+        if time.time() - self.last_switch > self.turn_duration:
+            self.switch_turn()
+
+    def switch_turn(self):
+        self.current_player = 1 - self.current_player
+        self.last_switch = time.time()
+        self.signal_turn_start()
+
+    def is_active(self, player_id):
+        return self.current_player == player_id
+
+#=================================================================================================
+# Gesture manager (gloves)
 class GestureManager:
     def __init__(self):
         self.mp_hands = mp.solutions.hands
@@ -107,7 +170,7 @@ class GestureManager:
             static_image_mode=False,
             min_detection_confidence=0.8,
             min_tracking_confidence=0.8,
-            max_num_hands=1
+            max_num_hands=2
         )
         self.mp_draw = mp.solutions.drawing_utils
         self.last_fist_time = 0
@@ -153,12 +216,14 @@ def main():
 
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     haptics = HapticManager()
+    turns = TurnManager(haptics)
     gestures = GestureManager()
 
     threading.Thread(target=music_loop, daemon=True).start()
-    threading.Thread(target=challenge_loop, args=(haptics,), daemon=True).start()
+    threading.Thread(target=challenge_loop, args=(haptics, turns), daemon=True).start()
 
     while cap.isOpened():
+        turns.update()
         ret, frame = cap.read()
         if not ret:
             break
@@ -167,7 +232,9 @@ def main():
         hands = gestures.get_hand_data(frame)
 
         if hands:
-            for hand_lms in hands:
+            for i, hand_lms in enumerate(hands):
+                if not turns.is_active(i):
+                    continue  # Ignore gestures if not their turn
                 gestures.mp_draw.draw_landmarks(frame, hand_lms, gestures.mp_hands.HAND_CONNECTIONS)
                 data = gestures.analyze_gesture(hand_lms)
 
@@ -183,8 +250,10 @@ def main():
 
                     if current_volume < prev_volume:
                         haptics.front_left(int(current_volume))
+                        haptics.sleeve_pulse(int(current_volume))
                     else:
                         haptics.front_right(int(current_volume))
+                        haptics.sleeve_pulse(int(current_volume))
 
                     prev_volume = current_volume
 
@@ -197,8 +266,10 @@ def main():
                 intensity = int(np.interp(music_speed, [0.5, 2.0], [0, 100]))
                 if music_speed < prev_speed:
                     haptics.back_left(intensity)
+                    haptics.sleeve_pulse(intensity)
                 else:
                     haptics.back_right(intensity)
+                    haptics.sleeve_pulse(intensity)
 
                 prev_speed = music_speed
 
