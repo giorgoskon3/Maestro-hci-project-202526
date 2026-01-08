@@ -1,7 +1,7 @@
 #===Game Description===#
 
-#Player 0: vest + glove
-#Player 1: sleeve + glove
+#Player 0: vest + glove(left hand)
+#Player 1: sleeve + glove(right hand)
 
 #===Users take turns===#
 #One player is active at a time
