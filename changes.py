@@ -36,15 +36,17 @@ import random
 #=================================================================================================
 # Audio setup
 audio, sr = librosa.load("music.mp3", sr=None, mono=True)
+audio_lock = threading.Lock()           # Lock for thread safety
 music_speed = 1.0
 music_playing = False
-current_volume = 50             #0-100 scale
-music_pitch = 0                 #0 = normal pitch
-challenge_active = False        #true when challenge event happens
+current_volume = 50                     #0-100 scale
+music_pitch = 0                         #0 = normal pitch
+challenge_active = False                #true when challenge event happens
 prev_volume = current_volume
 prev_speed = music_speed
 original_audio = audio.copy()
 processed_audio = audio.copy()
+audio_buffer = processed_audio.copy()   # Buffer used by audio callback
 
 #=================================================================================================
 # Haptics setup
@@ -92,34 +94,53 @@ class HapticManager:
         if self.connected:
             self.player.submit_dot("Arm", intensity=intensity, device_name=self.vest_name)
 
-#=================================================================================================
-# Audio loop
-def music_loop():
-    global music_playing, processed_audio, sr
-
-    while True:
-        if not music_playing:
-            sd.stop()
-            time.sleep(0.05)
-            continue
-
-        volume = current_volume / 100.0
-        sd.play(processed_audio * volume, sr, blocking=True)
-
 #===================================================================================================
 #Change audio
 def rebuild_audio():
-    global processed_audio, original_audio, music_speed, music_pitch, challenge_active
+    global processed_audio, original_audio, music_speed, music_pitch, challenge_active, audio_buffer
 
-    audio_out = librosa.effects.time_stretch(
-        original_audio.astype(np.float32), music_speed
-    )
+    # Apply time-stretch
+    audio_out = librosa.effects.time_stretch(original_audio.astype(np.float32), music_speed)
 
-    # Apply pitch ONLY during challenge
+    # Apply pitch shift ONLY during challenge
     if challenge_active and music_pitch != 0:
         audio_out = librosa.effects.pitch_shift(audio_out, sr=sr, n_steps=music_pitch)
 
-    processed_audio = audio_out
+    with audio_lock:
+        processed_audio = audio_out
+        audio_buffer = processed_audio.copy()  # update the buffer safely
+
+#===================================================================================================
+def audio_callback(outdata, frames, time_info, status):
+    global audio_buffer, current_volume, music_playing
+
+    # Safety: fill with silence if not playing
+    if not music_playing:
+        outdata[:] = np.zeros((frames, 1), dtype=np.float32)
+        return
+
+    with audio_lock:
+        # Get a chunk of audio
+        chunk = audio_buffer[:frames]
+        if len(chunk) < frames:
+            # Loop the music
+            chunk = np.pad(chunk, (0, frames - len(chunk)), 'constant')
+        # Apply volume
+        outdata[:, 0] = chunk * (current_volume / 100.0)
+        # Roll the buffer for looping
+        audio_buffer = np.roll(audio_buffer, -frames)
+
+#===================================================================================================
+def start_audio_stream():
+    stream = sd.OutputStream(
+        samplerate=sr,
+        channels=1,
+        callback=audio_callback,
+        blocksize=1024,
+        dtype='float32'
+    )
+    stream.start()
+    return stream
 
 #===================================================================================================
 # Challenge loop
@@ -243,7 +264,7 @@ def main():
     turns = TurnManager(haptics)
     gestures = GestureManager()
 
-    threading.Thread(target=music_loop, daemon=True).start()
+    audio_stream = start_audio_stream()  # Non-blocking playback
     threading.Thread(target=challenge_loop, args=(haptics, turns), daemon=True).start()
 
     while cap.isOpened():
@@ -271,7 +292,7 @@ def main():
                 if data['fingers'][0] and data['fingers'][1]:
                     target = np.interp(data['pinch_dist'], [0.03, 0.12], [0, 100])
                     current_volume = current_volume * 0.9 + target * 0.1
-                    current_volume = np.clip(current_volume, 0, 100)
+                    target = np.clip(np.interp(data['pinch_dist'], [0.03, 0.12], [0, 100]), 0, 100)
 
                     if current_volume < prev_volume:
                         if player_id == 0:
@@ -296,8 +317,8 @@ def main():
                     rebuild_audio()
                     prev_speed = music_speed
 
-                intensity = int(np.interp(music_speed, [0.5, 2.0], [0, 100]))
-                if music_speed < prev_speed:
+                intensity = int(np.interp(target_speed, [0.5, 2.0], [0, 100]))
+                if target_speed < prev_speed:
                     if player_id ==0:
                         haptics.back_left(intensity)
                     elif player_id ==1:
