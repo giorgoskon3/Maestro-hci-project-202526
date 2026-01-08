@@ -9,5 +9,6 @@ protobuf==3.20.3
 # Haptic Integration
 bhaptics-python
 
-#Audio processing
+#Audio playing-processing
 librosa-python
+sounddevice
