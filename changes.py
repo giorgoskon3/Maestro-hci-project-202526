@@ -1,4 +1,4 @@
-#===========================Game Description==============================#
+#===Game Description===#
 
 #Player 0: vest + glove
 #Player 1: sleeve + glove
@@ -6,7 +6,6 @@
 #===Users take turns===#
 #One player is active at a time
 #When signal is sent to glove, it's their turn
-#feedback is sent to both players, but only one at a time can play
 
 #===For both players===##
 #Fist: play-pause
@@ -21,7 +20,7 @@
 
 #Challenge 1:
 #at random time intervals
-#signal to front + back vest (player 0) or to sleeve (player 1) --> user points index up --> music plays at higher pitch
+#signal to front and back vest (player 0) or to sleeve (player 1) --> user points index up --> music plays at higher pitch
 
 #================================================================================================
 
@@ -249,11 +248,15 @@ def main():
                     current_volume = np.clip(current_volume, 0, 100)
 
                     if current_volume < prev_volume:
-                        haptics.front_left(int(current_volume))
-                        haptics.sleeve_pulse(int(current_volume))
+                        if turns.current_player ==0:
+                            haptics.front_left(int(current_volume))
+                        elif turns.current_player ==1:
+                            haptics.sleeve_pulse(int(current_volume))
                     else:
-                        haptics.front_right(int(current_volume))
-                        haptics.sleeve_pulse(int(current_volume))
+                        if turns.current_player ==0:
+                            haptics.front_right(int(current_volume))
+                        elif turns.current_player ==1:
+                            haptics.sleeve_pulse(int(current_volume))
 
                     prev_volume = current_volume
 
@@ -265,11 +268,15 @@ def main():
 
                 intensity = int(np.interp(music_speed, [0.5, 2.0], [0, 100]))
                 if music_speed < prev_speed:
-                    haptics.back_left(intensity)
-                    haptics.sleeve_pulse(intensity)
+                    if turns.current_player ==0:
+                        haptics.back_left(intensity)
+                    elif turns.current_player ==1:
+                        haptics.sleeve_pulse(intensity)
                 else:
-                    haptics.back_right(intensity)
-                    haptics.sleeve_pulse(intensity)
+                    if turns.current_player ==0:
+                        haptics.back_right(intensity)
+                    elif turns.current_player ==1:
+                        haptics.sleeve_pulse(intensity)
 
                 prev_speed = music_speed
 
