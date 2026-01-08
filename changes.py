@@ -15,12 +15,12 @@
 #for player 1 --> feedback to sleeve
 
 #Wrist Height: speed (< height --> lower)
-#for player 0 --> feedback to back vest (left for low, right for hight)
+#for player 0 --> feedback to back vest (left for low, right for high)
 #for player 1 --> feedback to sleeve
 
 #Challenge 1:
 #at random time intervals
-#signal to front and back vest (player 0) or to sleeve (player 1) --> user points index up --> music plays at higher pitch
+#signal to front + back vest (player 0) or to sleeve (player 1) --> user points index up --> music plays at higher pitch
 
 #================================================================================================
 
@@ -43,6 +43,8 @@ music_pitch = 0                 #0 = normal pitch
 challenge_active = False        #true when challenge event happens
 prev_volume = current_volume
 prev_speed = music_speed
+original_audio = audio.copy()
+processed_audio = audio.copy()
 
 #=================================================================================================
 # Haptics setup
@@ -91,30 +93,33 @@ class HapticManager:
             self.player.submit_dot("Arm", intensity=intensity, device_name=self.vest_name)
 
 #=================================================================================================
-# Music loop
+# Audio loop
 def music_loop():
-    global music_speed, music_playing, audio, sr, music_pitch
-
-    pos = 0
-    chunk_size = 2048
+    global music_playing, processed_audio, sr
 
     while True:
         if not music_playing:
             sd.stop()
-            sd.sleep(50)
+            time.sleep(0.05)
             continue
 
-        chunk = audio[pos:pos + chunk_size]
-        if len(chunk) < 32:
-            pos = 0
-            continue
+        volume = current_volume / 100.0
+        sd.play(processed_audio * volume, sr, blocking=True)
 
-        stretched = librosa.effects.time_stretch(chunk.astype(np.float32), music_speed)
-        pitched = librosa.effects.pitch_shift(stretched, sr, n_steps=music_pitch)
-        sd.play(pitched, sr, blocking=True)
+#===================================================================================================
+#Change audio
+def rebuild_audio():
+    global processed_audio, original_audio, music_speed, music_pitch, challenge_active
 
-        pos += int(chunk_size * music_speed)
-        sd.sleep(5)
+    audio_out = librosa.effects.time_stretch(
+        original_audio.astype(np.float32), music_speed
+    )
+
+    # Apply pitch ONLY during challenge
+    if challenge_active and music_pitch != 0:
+        audio_out = librosa.effects.pitch_shift(audio_out, sr=sr, n_steps=music_pitch)
+
+    processed_audio = audio_out
 
 #===================================================================================================
 # Challenge loop
@@ -128,6 +133,16 @@ def challenge_loop(haptics, turns):
             haptics.challenge_signal()
         else:
             haptics.sleeve_pulse(100)
+
+        #Challenge times out if player does nothing
+        start_time = time.time()
+        duration = 5
+        while time.time() - start_time < duration and challenge_active:
+            time.sleep(0.1)
+
+        if challenge_active:
+            print("Challenge timed out!")
+            challenge_active = False
 
 #=================================================================================================
 #Player turns manager
@@ -184,20 +199,26 @@ class GestureManager:
         else:
             return []
 
-    def recognize_fingers(self, hand_lms):
+    def recognize_fingers(self, hand_lms, hand_label):
         fingers = []
-        fingers.append(1 if hand_lms.landmark[4].x < hand_lms.landmark[3].x else 0)
+
+        # Thumb
+        if hand_label == 'Right':
+            fingers.append(1 if hand_lms.landmark[4].x < hand_lms.landmark[3].x else 0)
+        else:  # Left hand
+            fingers.append(1 if hand_lms.landmark[4].x > hand_lms.landmark[3].x else 0)
+
         tips = [8, 12, 16, 20]
         pips = [6, 10, 14, 18]
         for tip, pip in zip(tips, pips):
             fingers.append(1 if hand_lms.landmark[tip].y < hand_lms.landmark[pip].y else 0)
         return fingers
 
-    def analyze_gesture(self, hand_lms):
+    def analyze_gesture(self, hand_lms, hand_label):
         thumb_tip = hand_lms.landmark[4]
         index_tip = hand_lms.landmark[8]
         pinch_dist = ((thumb_tip.x - index_tip.x)**2 + (thumb_tip.y - index_tip.y)**2)**0.5
-        fingers = self.recognize_fingers(hand_lms)
+        fingers = self.recognize_fingers(hand_lms, hand_label)
         return {
             'fingers': fingers,
             'pinch_dist': pinch_dist,
@@ -240,7 +261,7 @@ def main():
                 if not turns.is_active(player_id):
                     continue  # Ignore gestures if not their turn
                 gestures.mp_draw.draw_landmarks(frame, hand_lms, gestures.mp_hands.HAND_CONNECTIONS)
-                data = gestures.analyze_gesture(hand_lms)
+                data = gestures.analyze_gesture(hand_lms, hand_label)
 
                 #👊 Fist → Play / Pause
                 if data['is_fist']:
@@ -248,8 +269,8 @@ def main():
 
                 #🤏 Pinch → Volume (thumb+index)
                 if data['fingers'][0] and data['fingers'][1]:
-                    target = np.interp(data['pinch_dist'], [0.02, 0.15], [0, 100])
-                    current_volume = current_volume * 0.85 + target * 0.15
+                    target = np.interp(data['pinch_dist'], [0.03, 0.12], [0, 100])
+                    current_volume = current_volume * 0.9 + target * 0.1
                     current_volume = np.clip(current_volume, 0, 100)
 
                     if current_volume < prev_volume:
@@ -268,8 +289,12 @@ def main():
                 #🖐 Wrist height → Speed
                 wrist_y = hand_lms.landmark[0].y
                 target_speed = np.interp(wrist_y, [0.8, 0.2], [0.6, 1.6])
+
                 music_speed = music_speed * 0.9 + target_speed * 0.1
                 music_speed = np.clip(music_speed, 0.5, 2.0)
+                if abs(music_speed - prev_speed) > 0.05:
+                    rebuild_audio()
+                    prev_speed = music_speed
 
                 intensity = int(np.interp(music_speed, [0.5, 2.0], [0, 100]))
                 if music_speed < prev_speed:
@@ -283,12 +308,12 @@ def main():
                     elif player_id ==1:
                         haptics.sleeve_pulse(intensity)
 
-                prev_speed = music_speed
-
                 #⚡ Challenge → Index finger up
                 if challenge_active and data['fingers'] == [0, 1, 0, 0, 0]:
                     music_pitch += 2
+                    music_pitch = np.clip(music_pitch, -12, 12)
                     challenge_active = False
+                    rebuild_audio()
 
         cv2.imshow("Maestro Gesture Recognition", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
