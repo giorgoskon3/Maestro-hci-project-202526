@@ -4,11 +4,11 @@ mediapipe==0.10.11
 numpy<2.0.0
 
 # Critical Fix for AttributeError / Protobuf issues
-protobuf==3.20.3
+protobuf
 
 # Haptic Integration
 bhaptics-python
 
 #Audio playing-processing
-librosa-python
+librosa
 sounddevice
