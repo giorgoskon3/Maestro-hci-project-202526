@@ -1,0 +1,603 @@
+import cv2
+import mediapipe as mp
+import time
+import numpy as np
+import threading
+import sounddevice as sd
+import librosa
+import random
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+#================================================================================================
+# Audio setup
+audio, sr = librosa.load("song.mp3", sr=None, mono=True)
+audio_lock = threading.Lock()
+music_speed = 1.0
+music_playing = False
+current_volume = 50.0
+music_pitch = 0
+challenge_active = False
+
+# Challenge system state
+current_challenge = None
+challenge_player = None
+challenge_end_time = 0.0
+
+# Scoring
+scores = [0, 0]
+prev_volume = current_volume
+prev_speed = music_speed
+original_audio = audio.copy()
+processed_audio = audio.copy()
+audio_buffer = processed_audio.copy()
+audio_position = 0
+
+last_speed_gesture_time = 0
+speed_gesture_cooldown = 0.4  # seconds
+speed_step = 0.1
+
+last_gesture_time = 0
+GESTURE_COOLDOWN = 0.4  # seconds
+
+#================================================================================================
+# Haptics setup with SDK2
+class HapticManager:
+    def __init__(self):
+        self.connected = False
+        self.bhaptics = None
+        self.loop = None
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        
+    async def initialize(self, app_id="maestro_app", api_key="", app_name="Maestro Music Controller"):
+        """Initialize bHaptics SDK2 with async"""
+        try:
+            import bhaptics_python
+            self.bhaptics = bhaptics_python
+            
+            # Initialize SDK
+            result = await self.bhaptics.registry_and_initialize(app_id, api_key, app_name)
+            
+            if result:
+                self.connected = True
+                print("✅ bHaptics SDK2 Connected!")
+                print("   Devices ready for haptic feedback")
+                
+                # Get connected devices
+                await asyncio.sleep(0.5)  # Give time for device detection
+                return True
+            else:
+                print("⚠️ bHaptics SDK initialized but no response")
+                self.connected = False
+                return False
+                
+        except ImportError as e:
+            print(f"⚠️ Cannot import bHaptics SDK2: {e}")
+            print("   Install with: pip install bhaptics-python-sdk2")
+            self.connected = False
+            return False
+        except Exception as e:
+            print(f"⚠️ Error initializing bHaptics SDK2: {e}")
+            self.connected = False
+            return False
+
+    def sync_call(self, coro):
+        """Helper to call async functions from sync context"""
+        if self.loop is None:
+            return None
+        future = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        return future.result(timeout=0.1)
+
+    async def front_left(self, intensity):
+        """Front left vest vibration"""
+        if self.connected and self.bhaptics:
+            try:
+                # Vest front - left side motors (indices 0-3)
+                values = [0] * 20
+                values[0] = int(intensity)
+                values[1] = int(intensity * 0.8)
+                await self.bhaptics.play_dot(0, 100, values)  # Device 0 = Vest
+            except Exception as e:
+                print(f"Haptic error (front_left): {e}")
+
+    async def front_right(self, intensity):
+        """Front right vest vibration"""
+        if self.connected and self.bhaptics:
+            try:
+                values = [0] * 20
+                values[4] = int(intensity)
+                values[5] = int(intensity * 0.8)
+                await self.bhaptics.play_dot(0, 100, values)
+            except Exception as e:
+                print(f"Haptic error (front_right): {e}")
+
+    async def back_left(self, intensity):
+        """Back left vest vibration"""
+        if self.connected and self.bhaptics:
+            try:
+                values = [0] * 20
+                values[10] = int(intensity)
+                values[11] = int(intensity * 0.8)
+                await self.bhaptics.play_dot(0, 100, values)
+            except Exception as e:
+                print(f"Haptic error (back_left): {e}")
+
+    async def back_right(self, intensity):
+        """Back right vest vibration"""
+        if self.connected and self.bhaptics:
+            try:
+                values = [0] * 20
+                values[14] = int(intensity)
+                values[15] = int(intensity * 0.8)
+                await self.bhaptics.play_dot(0, 100, values)
+            except Exception as e:
+                print(f"Haptic error (back_right): {e}")
+
+    async def challenge_signal(self, intensity=100):
+        """Central vest pulse for challenges"""
+        if self.connected and self.bhaptics:
+            try:
+                # Center front vibration
+                values = [0] * 20
+                values[2] = intensity
+                values[3] = intensity
+                await self.bhaptics.play_dot(0, 200, values)
+            except Exception as e:
+                print(f"Haptic error (challenge): {e}")
+
+    async def left_glove_pulse(self, intensity=100):
+        """Left glove pulse"""
+        if self.connected and self.bhaptics:
+            try:
+                # Left glove - device index 8
+                motors = [intensity] * 6
+                playtimes = [200] * 6
+                shapes = [2] * 6  # Shape 2 = continuous
+                await self.bhaptics.play_glove(8, motors, playtimes, shapes, 0)
+            except Exception as e:
+                print(f"Haptic error (glove): {e}")
+
+    async def right_glove_pulse(self, intensity=100):
+        """Right sleeve/arm pulse"""
+        if self.connected and self.bhaptics:
+            try:
+                # Right glove - device index 9
+                motors = [intensity] * 6
+                playtimes = [200] * 6
+                shapes = [2] * 6
+                await self.bhaptics.play_glove(9, motors, playtimes, shapes, 0)
+            except Exception as e:
+                print(f"Haptic error (sleeve): {e}")
+
+    async def success_signal(self, player_id, intensity=100):
+        """Success haptic pattern"""
+        if not self.connected:
+            return
+        if player_id == 0:
+            await self.left_glove_pulse(intensity)
+            await asyncio.sleep(0.1)
+            await self.front_right(intensity)
+        else:
+            await self.right_glove_pulse(intensity)
+
+    async def stop_all(self):
+        """Stop all haptic feedback"""
+        if self.connected and self.bhaptics:
+            try:
+                await self.bhaptics.stop_all()
+            except:
+                pass
+
+    async def close(self):
+        """Cleanup and close SDK"""
+        if self.connected and self.bhaptics:
+            try:
+                await self.bhaptics.stop_all()
+                await self.bhaptics.close()
+                print("🔚 bHaptics SDK closed")
+            except:
+                pass
+
+#===================================================================================================
+# Change audio
+def rebuild_audio():
+    global processed_audio, original_audio, music_speed, music_pitch, audio_buffer, audio_position
+    
+    audio_out = librosa.effects.time_stretch(original_audio, rate=music_speed)
+    
+    if music_pitch != 0:
+        audio_out = librosa.effects.pitch_shift(audio_out, sr=sr, n_steps=music_pitch)
+    
+    with audio_lock:
+        processed_audio = audio_out
+        audio_buffer = processed_audio.copy()
+        audio_position = 0
+
+#===================================================================================================
+def audio_callback(outdata, frames, time_info, status):
+    global audio_buffer, current_volume, music_playing, audio_position
+    
+    if not music_playing:
+        outdata[:] = np.zeros((frames, 1), dtype=np.float32)
+        return
+    
+    with audio_lock:
+        buffer_len = len(audio_buffer)
+        if buffer_len == 0:
+            outdata[:] = np.zeros((frames, 1), dtype=np.float32)
+            return
+        
+        end_pos = audio_position + frames
+        
+        if end_pos <= buffer_len:
+            chunk = audio_buffer[audio_position:end_pos]
+            audio_position = end_pos
+        else:
+            chunk = np.concatenate([
+                audio_buffer[audio_position:],
+                audio_buffer[:end_pos - buffer_len]
+            ])
+            audio_position = end_pos - buffer_len
+        
+        if len(chunk) < frames:
+            chunk = np.pad(chunk, (0, frames - len(chunk)), 'constant')
+        
+        outdata[:, 0] = chunk * (current_volume / 100.0)
+
+#===================================================================================================
+def start_audio_stream():
+    stream = sd.OutputStream(
+        samplerate=sr,
+        channels=1,
+        callback=audio_callback,
+        blocksize=1024,
+        dtype='float32'
+    )
+    stream.start()
+    return stream
+
+#===================================================================================================
+# Async challenge loop
+async def challenge_loop_async(haptics, turns):
+    global challenge_active, current_challenge, challenge_player, challenge_end_time, scores
+    
+    challenge_types = ["PITCH", "SPEED", "VOLUME"]
+    
+    await asyncio.sleep(10)
+    
+    while True:
+        await asyncio.sleep(random.uniform(10, 20))
+        
+        challenge_active = True
+        current_challenge = random.choice(challenge_types)
+        challenge_player = turns.current_player
+        duration = 5
+        challenge_end_time = time.time() + duration
+        
+        print(f"⚡ Challenge started for Player {challenge_player} ({current_challenge})")
+        
+        if challenge_player == 0:
+            await haptics.challenge_signal()
+        else:
+            await haptics.left_glove_pulse(100)
+        
+        if current_challenge == "PITCH":
+            print("➡️ Do: INDEX UP (only index finger) to increase pitch!")
+        elif current_challenge == "SPEED":
+            print("➡️ Do: V SIGN (index+middle up) to increase speed!")
+        else:
+            print("➡️ Do: THUMBS UP (only thumb up) to boost volume!")
+        
+        while time.time() < challenge_end_time and challenge_active:
+            await asyncio.sleep(0.05)
+        
+        if challenge_active:
+            print(f"⏱️ Challenge timed out! Player {challenge_player} -5 points")
+            scores[challenge_player] = max(0, scores[challenge_player] - 5)
+            challenge_active = False
+            current_challenge = None
+            challenge_player = None
+
+#=================================================================================================
+# Player turns manager
+class TurnManager:
+    def __init__(self, haptics, loop):
+        self.current_player = 0
+        self.haptics = haptics
+        self.loop = loop
+        self.turn_duration = 30
+        self.last_switch = time.time()
+        asyncio.run_coroutine_threadsafe(self.signal_turn_start(), loop)
+
+    async def signal_turn_start(self):
+        if self.current_player == 0:
+            print("🎮 Player 0's Turn (Vest + Left Glove)")
+            await self.haptics.left_glove_pulse(100)
+        else:
+            print("🎮 Player 1's Turn (Sleeve + Right Glove)")
+            await self.haptics.right_glove_pulse(100)
+
+    def update(self):
+        if time.time() - self.last_switch > self.turn_duration:
+            self.switch_turn()
+
+    def switch_turn(self):
+        self.current_player = 1 - self.current_player
+        self.last_switch = time.time()
+        asyncio.run_coroutine_threadsafe(self.signal_turn_start(), self.loop)
+
+    def is_active(self, player_id):
+        return self.current_player == player_id
+
+#=================================================================================================
+# Gesture manager
+class GestureManager:
+    def __init__(self):
+        self.mp_hands = mp.solutions.hands
+        self.hands = self.mp_hands.Hands(
+            static_image_mode=False,
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.7,
+            max_num_hands=2
+        )
+        self.mp_draw = mp.solutions.drawing_utils
+        self.last_fist_time = 0
+        self.fist_cooldown = 0.5
+
+    def get_hand_data(self, frame):
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.hands.process(rgb)
+        if results.multi_hand_landmarks and results.multi_handedness:
+            return list(zip(results.multi_hand_landmarks, results.multi_handedness))
+        return []
+
+    def recognize_fingers(self, hand_lms, hand_label):
+        fingers = []
+        
+        if hand_label == 'Right':
+            fingers.append(1 if hand_lms.landmark[4].x < hand_lms.landmark[3].x else 0)
+        else:
+            fingers.append(1 if hand_lms.landmark[4].x > hand_lms.landmark[3].x else 0)
+        
+        tips = [8, 12, 16, 20]
+        pips = [6, 10, 14, 18]
+        for tip, pip in zip(tips, pips):
+            fingers.append(1 if hand_lms.landmark[tip].y < hand_lms.landmark[pip].y else 0)
+        
+        return fingers
+
+    def analyze_gesture(self, hand_lms, hand_label):
+        thumb_tip = hand_lms.landmark[4]
+        index_tip = hand_lms.landmark[8]
+        pinch_dist = ((thumb_tip.x - index_tip.x)**2 + (thumb_tip.y - index_tip.y)**2)**0.5
+        
+        fingers = self.recognize_fingers(hand_lms, hand_label)
+        
+        return {
+            'fingers': fingers,
+            'pinch_dist': pinch_dist,
+            'is_fist': sum(fingers) == 0
+        }
+
+    def on_fist_detected(self):
+        global music_playing
+        now = time.time()
+        if now - self.last_fist_time > self.fist_cooldown:
+            self.last_fist_time = now
+            music_playing = not music_playing
+            print("▶️ PLAY" if music_playing else "⏸️ PAUSE")
+
+#=================================================================================================
+
+def gesture_cooldown_active():
+    global last_gesture_time
+    return time.time() - last_gesture_time < GESTURE_COOLDOWN
+
+def trigger_gesture_cooldown():
+    global last_gesture_time
+    last_gesture_time = time.time()
+
+# Main async function
+async def main_async():
+    global music_speed, current_volume, prev_volume, prev_speed, music_pitch 
+    global challenge_active, current_challenge, challenge_player, scores, last_speed_gesture_time
+    
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("❌ Error: Could not open camera")
+        return
+    
+    # Initialize haptics
+    haptics = HapticManager()
+    loop = asyncio.get_event_loop()
+    haptics.loop = loop
+    
+    # Initialize SDK2
+    print("🔄 Initializing bHaptics SDK2...")
+    await haptics.initialize()
+    
+    if not haptics.connected:
+        print("⚠️ Running in Simulation Mode (No haptic feedback)")
+    
+    turns = TurnManager(haptics, loop)
+    gestures = GestureManager()
+    audio_stream = start_audio_stream()
+    
+    # Start challenge loop
+    asyncio.create_task(challenge_loop_async(haptics, turns))
+    
+    print("🎵 Maestro System Started!")
+    print("Controls:")
+    print("  👊 Fist = Play/Pause")
+    print("  🤏 Pinch = Volume Control")
+    print("  🖐️ Wrist Height = Speed Control")
+    print("  Press 'q' to quit")
+    
+    try:
+        while cap.isOpened():
+            turns.update()
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            frame = cv2.flip(frame, 1)
+            hands = gestures.get_hand_data(frame)
+            
+            if hands:
+                for hand_lms, handedness in hands:
+                    hand_label = handedness.classification[0].label
+                    player_id = 0 if hand_label == 'Left' else 1
+                    
+                    if not turns.is_active(player_id):
+                        continue
+                    
+                    gestures.mp_draw.draw_landmarks(
+                        frame, hand_lms, gestures.mp_hands.HAND_CONNECTIONS
+                    )
+                    
+                    data = gestures.analyze_gesture(hand_lms, hand_label)
+                    if gesture_cooldown_active():
+                        continue
+                    
+                    # Fist → Play/Pause
+                    if data['is_fist']:
+                        gestures.on_fist_detected()
+                        trigger_gesture_cooldown()
+                    
+                    # Pinch → Volume
+                    if data['fingers'][0] and data['fingers'][1] and sum(data['fingers']) == 2:
+                        target = np.clip(np.interp(data['pinch_dist'], [0.03, 0.12], [0, 100]), 0, 100)
+                        current_volume = current_volume * 0.8 + target * 0.2
+                        
+                        if abs(current_volume - prev_volume) > 2:
+                            intensity = int(current_volume)
+                            if current_volume < prev_volume:
+                                if player_id == 0:
+                                    asyncio.create_task(haptics.front_left(intensity))
+                                else:
+                                    asyncio.create_task(haptics.right_glove_pulse(intensity))
+                            else:
+                                if player_id == 0:
+                                    asyncio.create_task(haptics.front_right(intensity))
+                                else:
+                                    asyncio.create_task(haptics.right_glove_pulse(intensity))
+                            prev_volume = current_volume
+                            trigger_gesture_cooldown()
+                    
+                    # ✌️ / 3️⃣ Speed Control (gesture-based, no wrist height)
+                    if not challenge_active:
+                        fingers = data['fingers']
+                        now = time.time()
+                        trigger_gesture_cooldown()
+
+
+                    if now - last_speed_gesture_time > speed_gesture_cooldown:
+                        # ✌️ V sign → speed UP
+                        if fingers == [0, 1, 1, 0, 0]:
+                            last_speed_gesture_time = now
+                            music_speed = float(np.clip(music_speed + speed_step, 0.5, 2.0))
+                            rebuild_audio()
+                            prev_speed = music_speed
+                            print(f"⏩ Speed UP → {music_speed:.2f}x")
+
+                            intensity = int(np.interp(music_speed, [0.5, 2.0], [40, 100]))
+                            if player_id == 0:
+                                asyncio.create_task(haptics.front_right(intensity))
+                            else:
+                                asyncio.create_task(haptics.right_glove_pulse(intensity))
+                            trigger_gesture_cooldown()
+                        
+                        # 3️⃣ Three fingers → speed DOWN
+                        elif fingers == [0, 1, 1, 1, 0]:
+                            last_speed_gesture_time = now
+                            music_speed = float(np.clip(music_speed - speed_step, 0.5, 2.0))
+                            rebuild_audio()
+                            prev_speed = music_speed
+                            print(f"⏪ Speed DOWN → {music_speed:.2f}x")
+
+                            intensity = int(np.interp(music_speed, [0.5, 2.0], [40, 100]))
+                            if player_id == 0:
+                                asyncio.create_task(haptics.back_left(intensity))
+                            else:
+                                asyncio.create_task(haptics.right_glove_pulse(intensity))
+                            trigger_gesture_cooldown()
+
+                    # Challenge handling
+                    if challenge_active and player_id == challenge_player:
+                        fingers = data['fingers']
+                        success = False
+                        
+                        if current_challenge == "PITCH" and fingers == [0, 1, 0, 0, 0]:
+                            music_pitch += 2
+                            music_pitch = np.clip(music_pitch, -12, 12)
+                            rebuild_audio()
+                            success = True
+                            print(f"✅ PITCH Challenge completed! (+10 points)")
+                        
+                        elif current_challenge == "SPEED" and fingers == [0, 1, 1, 0, 0]:
+                            music_speed = float(np.clip(music_speed + 0.25, 0.5, 2.0))
+                            rebuild_audio()
+                            success = True
+                            print(f"✅ SPEED Challenge completed! (+10 points)")
+                        
+                        elif current_challenge == "VOLUME" and fingers == [1, 0, 0, 0, 0]:
+                            current_volume = float(np.clip(current_volume + 15, 0, 100))
+                            success = True
+                            print(f"✅ VOLUME Challenge completed! (+10 points)")
+                        
+                        if success:
+                            scores[player_id] += 10
+                            asyncio.create_task(haptics.success_signal(player_id, 100))
+                            challenge_active = False
+                            current_challenge = None
+                            challenge_player = None
+            
+            # UI Overlay
+            cv2.putText(frame, f"P0: {scores[0]}", (20, 40), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
+            cv2.putText(frame, f"P1: {scores[1]}", (20, 80), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
+            
+            turn_label = "P0 (Left)" if turns.current_player == 0 else "P1 (Right)"
+            cv2.putText(frame, f"Turn: {turn_label}", (20, 120), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 3)
+            
+            status = "PLAYING" if music_playing else "PAUSED"
+            status_color = (0, 255, 0) if music_playing else (0, 100, 255)
+            cv2.putText(frame, status, (20, 160), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 3)
+            cv2.putText(frame, f"Vol: {int(current_volume)}%", (20, 190), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 3)
+            cv2.putText(frame, f"Speed: {music_speed:.2f}x", (20, 220), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 3)
+            
+            if challenge_active and current_challenge and challenge_player is not None:
+                remaining = max(0.0, challenge_end_time - time.time())
+                if current_challenge == "PITCH":
+                    prompt = "CHALLENGE: INDEX UP"
+                elif current_challenge == "SPEED":
+                    prompt = "CHALLENGE: V SIGN"
+                else:
+                    prompt = "CHALLENGE: THUMBS UP"
+                
+                cv2.putText(frame, f"{prompt} ({remaining:.1f}s)", (20, 260), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 3)
+            
+            cv2.imshow("Maestro Gesture Recognition", frame)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+            
+            # Allow async tasks to run
+            await asyncio.sleep(0.001)
+    
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        audio_stream.stop()
+        audio_stream.close()
+        await haptics.close()
+
+#=================================================================================================
+if __name__ == "__main__":
+    asyncio.run(main_async())
