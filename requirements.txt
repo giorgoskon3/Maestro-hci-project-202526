@@ -1,7 +1,7 @@
 # Core Vision & Processing
-opencv-python>=4.8.0
+opencv-python
 mediapipe==0.10.11
-numpy<2.0.0
+numpy
 
 # Critical Fix for AttributeError / Protobuf issues
 protobuf
